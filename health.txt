@@ -1,0 +1,108 @@
+def get_fedsso_bearer_header(
+    client_id: str,
+    client_secret: str,
+    token_url: str,
+    metadata=None,
+    request_id=None
+) -> Dict[str, str]:
+    """
+    Returns Authorization header with Bearer token
+    """
+    token = get_fedsso_auth_token(
+        client_id=client_id,
+        client_secret=client_secret,
+        token_url=token_url,
+        metadata=metadata,
+        request_id=request_id
+    )
+    return {
+        "Authorization": f"Bearer {token}"
+    }
+
+
+Manifest change (THIS is the key)
+"headers": {
+  "Content-Type": "application/json",
+  "Authorization": {
+    "type": "function",
+    "module": "utils.api_key",
+    "function": "get_fedsso_bearer_header",
+    "args": {
+      "client_id": "${environments.${environment}.secrets.client_id}",
+      "client_secret": "${environments.${environment}.secrets.client_secret}",
+      "token_url": "${environments.${environment}.urls.fedsso_url}"
+    }
+  }
+}
+
+
+
+
+health_service.py:
+
+def _resolve_headers(
+    self,
+    headers: Dict[str, Any],
+    metadata: Optional[Dict[str, Any]] = None
+) -> Dict[str, str]:
+    """
+    Resolve dynamic headers (function-based) into static headers
+    """
+    resolved: Dict[str, str] = {}
+
+    for header_name, header_value in headers.items():
+        # Function-based header
+        if isinstance(header_value, dict) and header_value.get("type") == "function":
+            module_name = header_value.get("module")
+            function_name = header_value.get("function")
+            args = header_value.get("args", {})
+
+            if not module_name or not function_name:
+                raise ValueError(f"Invalid function header config for {header_name}")
+
+            module = __import__(module_name, fromlist=[function_name])
+            func = getattr(module, function_name)
+
+            result = func(**args, metadata=metadata)
+
+            # If function returns full header dict
+            if isinstance(result, dict):
+                resolved.update(result)
+            else:
+                resolved[header_name] = str(result)
+
+        # Static header
+        else:
+            resolved[header_name] = str(header_value)
+
+    return resolved
+
+
+resolved_headers = self._resolve_headers(target.headers)
+
+request_kwargs = {
+    "method": target.method,
+    "url": target.url,
+    "headers": resolved_headers,
+    "timeout": target.timeout_seconds,
+}
+
+
+{
+  "name": "convert-endpoint",
+  "url": "${environments.${environment}.urls.api_base_url}/sas2py/convert",
+  "method": "POST",
+  "headers": {
+    "Content-Type": "application/json",
+    "Authorization": {
+      "type": "function",
+      "module": "utils.api_key",
+      "function": "get_fedsso_auth_token",
+      "args": {
+        "client_id": "${environments.${environment}.secrets.client_id}",
+        "client_secret": "${environments.${environment}.secrets.client_secret}",
+        "token_url": "${environments.${environment}.urls.fedsso_url}"
+      }
+    }
+  }
+}
