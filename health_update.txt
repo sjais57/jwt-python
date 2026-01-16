@@ -1,0 +1,322 @@
+Step 1: Update the dataclass to allow dynamic headers
+# In health_service.py, update the HealthCheckTargetConfig dataclass:
+@dataclass
+class HealthCheckTargetConfig:
+    """Configuration for a health check target"""
+    name: str
+    url: str
+    method: str = "GET"
+    headers: Dict[str, Any] = field(default_factory=dict)  # CHANGE: Any instead of str
+    payload: Optional[Dict[str, Any]] = None
+    timeout_seconds: int = 10
+    expected_status_codes: List[int] = field(default_factory=lambda: [200])
+    response_json_path: Optional[str] = None
+    expected_value: Optional[Any] = None
+    response_contains: Optional[str] = None
+    response_not_contains: Optional[str] = None
+    critical: bool = True
+    retry_count: int = 1
+    retry_delay_seconds: float = 1.0
+
+
+  Step 2: Add the header resolver method to HealthCheckService
+
+# Add this method to HealthCheckService class
+class HealthCheckService:
+    # ... existing code ...
+    
+    def _resolve_headers(
+        self,
+        headers: Dict[str, Any],
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, str]:
+        """
+        Resolve dynamic headers (function-based) into static headers.
+        
+        Supports:
+        - Static headers: "Authorization": "Bearer token"
+        - Function-based headers: "Authorization": { "type": "function", ... }
+        
+        Function headers should return either:
+        - A string value (e.g., "Bearer eyJ...")
+        - A dict with header name/value pairs
+        """
+        resolved: Dict[str, str] = {}
+        
+        for header_name, header_value in headers.items():
+            # Function-based header
+            if isinstance(header_value, dict) and header_value.get("type") == "function":
+                try:
+                    module_name = header_value.get("module")
+                    function_name = header_value.get("function")
+                    args = header_value.get("args", {})
+                    
+                    if not module_name or not function_name:
+                        logger.warning(
+                            f"Invalid function header config for {header_name}: "
+                            f"missing module or function"
+                        )
+                        continue
+                    
+                    # Import the module and get the function
+                    # Note: using __import__ for compatibility
+                    module = __import__(module_name, fromlist=[function_name])
+                    func = getattr(module, function_name)
+                    
+                    logger.debug(f"Calling {module_name}.{function_name} for header {header_name}")
+                    
+                    # Add metadata if provided
+                    kwargs = args.copy()
+                    if metadata:
+                        kwargs["metadata"] = metadata
+                    
+                    # Call the function
+                    result = func(**kwargs)
+                    
+                    # Handle the result
+                    if isinstance(result, dict):
+                        # If function returns full header dict, merge it
+                        resolved.update(result)
+                    else:
+                        # Otherwise use as the header value
+                        resolved[header_name] = str(result)
+                        
+                    logger.debug(f"Successfully resolved header {header_name}")
+                    
+                except ImportError as e:
+                    logger.error(f"Failed to import module {module_name} for header {header_name}: {e}")
+                    resolved[header_name] = "INVALID_TOKEN_MISSING_MODULE"
+                except AttributeError as e:
+                    logger.error(f"Function {function_name} not found in module {module_name} for header {header_name}: {e}")
+                    resolved[header_name] = "INVALID_TOKEN_MISSING_FUNCTION"
+                except Exception as e:
+                    logger.error(f"Error executing function for header {header_name}: {e}")
+                    resolved[header_name] = "INVALID_TOKEN_EXECUTION_ERROR"
+            
+            # Static header value
+            else:
+                resolved[header_name] = str(header_value)
+        
+        return resolved
+
+
+Step 3: Update the _perform_check method to use resolved headers
+# Update the _perform_check method in HealthCheckService
+async def _perform_check(self, target: HealthCheckTargetConfig) -> HealthCheckResult:
+    """Perform a single health check attempt"""
+    # Resolve dynamic headers first
+    resolved_headers = self._resolve_headers(target.headers)
+    
+    # Build request
+    request_kwargs = {
+        "method": target.method,
+        "url": target.url,
+        "headers": resolved_headers,  # Use resolved headers
+        "timeout": target.timeout_seconds,
+    }
+    
+    if target.payload and target.method.upper() in ("POST", "PUT", "PATCH"):
+        request_kwargs["json"] = target.payload
+    
+    # Make request
+    response = await self.http_client.request(**request_kwargs)
+    
+    # ... rest of the method remains unchanged ...
+
+Step 4: Create or update the get_fedsso_auth_token function
+# In utils/api_key.py
+def get_fedsso_auth_token(
+    client_id: str,
+    client_secret: str,
+    token_url: str,
+    metadata=None,
+    request_id=None
+) -> str:
+    """
+    Fetch an OAuth2 access token from the FEDS SSO endpoint using client credentials.
+    Returns just the token string.
+    """
+    logger.info(f"Fetching FEDSSO auth token for client_id={client_id}")
+    
+    # Your existing implementation...
+    response = httpx.post(
+        token_url,
+        data={
+            "grant_type": "client_credentials",
+            "client_id": client_id,
+            "client_secret": client_secret
+        },
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=10
+    )
+    
+    response.raise_for_status()
+    return response.json().get("access_token")
+
+  Step 5: Create a wrapper function that formats as Bearer header
+# Also in utils/api_key.py
+def get_fedsso_bearer_header(
+    client_id: str,
+    client_secret: str,
+    token_url: str,
+    metadata=None,
+    request_id=None
+) -> Dict[str, str]:
+    """
+    Returns complete Authorization header dict with Bearer token.
+    This is what your health check should call.
+    """
+    token = get_fedsso_auth_token(
+        client_id=client_id,
+        client_secret=client_secret,
+        token_url=token_url,
+        metadata=metadata,
+        request_id=request_id
+    )
+    
+    return {
+        "Authorization": f"Bearer {token}"
+    }
+
+Step 6: Update your manifest to use the correct format
+{
+  "module_type": "health_check",
+  "name": "sas2py-health",
+  "config": {
+    "targets": [
+      {
+        "name": "convert-endpoint",
+        "url": "${environments.${environment}.urls.api_base_url}/sas2py/convert",
+        "method": "POST",
+        "headers": {
+          "Content-Type": "application/json",
+          "Authorization": {
+            "type": "function",
+            "module": "utils.api_key",
+            "function": "get_fedsso_bearer_header",
+            "args": {
+              "client_id": "${environments.${environment}.secrets.client_id}",
+              "client_secret": "${environments.${environment}.secrets.client_secret}",
+              "token_url": "${environments.${environment}.urls.fedsso_url}"
+            }
+          }
+        },
+        "payload": {
+          "messages": [
+            {"role": "user", "content": "/* Health check */ data test; x=1; run;"}
+          ],
+          "max_tokens": 50
+        },
+        "timeout_seconds": 30,
+        "expected_status_codes": [200, 401],
+        "critical": false,
+        "retry_count": 1,
+        "retry_delay_seconds": 1.0
+      }
+    ]
+  }
+}
+
+Step 7: Optional - Add token caching (highly recommended)
+# In utils/api_key.py, add caching to get_fedsso_auth_token
+import time
+from functools import lru_cache
+from threading import Lock
+
+# Simple cache with expiry
+_token_cache = {}
+_cache_lock = Lock()
+_CACHE_TTL = 300  # 5 minutes
+
+def _get_cached_token(client_id: str, token_url: str) -> Optional[str]:
+    """Get token from cache if not expired."""
+    cache_key = f"{client_id}_{token_url}"
+    
+    with _cache_lock:
+        cached_data = _token_cache.get(cache_key)
+        if cached_data and time.time() < cached_data["expires_at"]:
+            return cached_data["token"]
+    return None
+
+def _set_cached_token(client_id: str, token_url: str, token: str, expires_in: int = 300):
+    """Store token in cache with expiry."""
+    cache_key = f"{client_id}_{token_url}"
+    
+    with _cache_lock:
+        _token_cache[cache_key] = {
+            "token": token,
+            "expires_at": time.time() + min(expires_in, _CACHE_TTL) - 60  # 60s buffer
+        }
+
+def get_fedsso_auth_token_cached(
+    client_id: str,
+    client_secret: str,
+    token_url: str,
+    metadata=None,
+    request_id=None
+) -> str:
+    """
+    Cached version of get_fedsso_auth_token.
+    """
+    # Check cache first
+    cached_token = _get_cached_token(client_id, token_url)
+    if cached_token:
+        logger.info(f"Using cached FEDSSO token for {client_id}")
+        return cached_token
+    
+    # Fetch fresh token
+    logger.info(f"Fetching fresh FEDSSO token for {client_id}")
+    
+    try:
+        response = httpx.post(
+            token_url,
+            data={
+                "grant_type": "client_credentials",
+                "client_id": client_id,
+                "client_secret": client_secret
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=10
+        )
+        
+        response.raise_for_status()
+        token_data = response.json()
+        token = token_data.get("access_token")
+        
+        # Cache with expiry from response if available
+        expires_in = token_data.get("expires_in", _CACHE_TTL)
+        _set_cached_token(client_id, token_url, token, expires_in)
+        
+        return token
+        
+    except Exception as e:
+        logger.error(f"Failed to fetch FEDSSO token: {e}")
+        raise
+
+Step 8: Create a simplified wrapper for health checks
+# For even simpler health check usage
+def get_health_check_fedsso_token() -> Dict[str, str]:
+    """
+    Simplified wrapper specifically for health checks.
+    Uses environment variables for configuration.
+    """
+    import os
+    
+    return get_fedsso_bearer_header(
+        client_id=os.getenv("FEDSSO_CLIENT_ID"),
+        client_secret=os.getenv("FEDSSO_CLIENT_SECRET"),
+        token_url=os.getenv("FEDSSO_TOKEN_URL"),
+        request_id=f"health-check-{int(time.time())}"
+    )
+
+  Then in your manifest:
+
+"headers": {
+  "Content-Type": "application/json",
+  "Authorization": {
+    "type": "function",
+    "module": "utils.api_key",
+    "function": "get_health_check_fedsso_token"
+  }
+}
+       
