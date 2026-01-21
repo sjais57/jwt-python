@@ -79,3 +79,17 @@ async def all_projects_health():
     }
 
 
+"headers": {
+  "Content-Type": "application/json",
+  "Authorization": {
+    "type": "function",
+    "module": "utils.api_key",
+    "function": "get_fedsso_auth_token",
+    "prefix": "Bearer ",
+    "args": {
+      "client_id": "${environments.${environment}.secrets.client_id}",
+      "client_secret": "${environments.${environment}.secrets.client_secret}",
+      "token_url": "${environments.${environment}.urls.fedsso_url}"
+    }
+  }
+}
