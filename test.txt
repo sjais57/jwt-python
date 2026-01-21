@@ -1,0 +1,81 @@
+✅ STEP 1 — Fix get_project_health() (MANDATORY)
+
+async def get_project_health(self, project_id: str) -> Dict[str, Any]:
+    # ✅ Ensure project is configured BEFORE health
+    if project_id not in self.project_routing:
+        logger.info(f"[Health] Auto-configuring project {project_id}")
+        await self.analyze_and_configure_project(project_id)
+
+    health_service = self.health_services.get(project_id)
+
+    if not health_service:
+        return {
+            "status": "unhealthy",
+            "message": "Health service not configured from manifest",
+            "project_id": project_id,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+
+    return await health_service.check_all()
+
+✅ STEP 2 — Fix liveness & readiness (same issue)
+
+async def get_project_liveness(self, project_id: str) -> Dict[str, Any]:
+    if project_id not in self.project_routing:
+        await self.analyze_and_configure_project(project_id)
+
+    svc = self.health_services.get(project_id)
+    return await svc.liveness_check() if svc else {
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+
+async def get_project_readiness(self, project_id: str) -> Dict[str, Any]:
+    if project_id not in self.project_routing:
+        await self.analyze_and_configure_project(project_id)
+
+    svc = self.health_services.get(project_id)
+    return await svc.readiness_check() if svc else {
+        "status": "unhealthy",
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+
+
+✅ STEP 3 — Make /health NOT lie
+
+
+@app.get("/health")
+async def health_check():
+    return await app.state.front_door.get_status()
+
+
+@app.get("/health/projects")
+async def all_projects_health():
+    results = {}
+
+    for project_id in app.state.front_door.project_routing.keys():
+        results[project_id] = await app.state.front_door.get_project_health(project_id)
+
+    return {
+        "status": "ok",
+        "projects": results,
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+
+@app.get("/health/projects")
+async def all_projects_health():
+    results = {}
+
+    for project_id in app.state.front_door.project_routing.keys():
+        results[project_id] = await app.state.front_door.get_project_health(project_id)
+
+    return {
+        "status": "ok",
+        "projects": results,
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+
